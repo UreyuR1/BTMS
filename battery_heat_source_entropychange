@@ -1,0 +1,162 @@
+#include "udf.h"
+#include "math.h"
+
+/* 参数 */
+#define BATTERY_CAPACITY 3.2        /* Ah */
+#define NOMINAL_VOLTAGE 3.6         /* V */
+
+/* 工况 */
+#define C_RATE 2.0                  /* C倍率*/
+
+/* 论文提到但未给出具体数值的参数,供参考 */
+#define INTERNAL_RESISTANCE 0.045   /* Ω - 内阻 */
+/*
+ * 默认的电池熵系数（dE/dT）为常数值 -0.4 mV/K，用于估算在低荷电状态下
+ * 的可逆热。文献表明熵系数随着荷电状态（SOC）变化：在低SOC时为负，
+ * 在约60% SOC处接近零，在70–80% SOC时变为正，并在高SOC时再次稍微
+ * 下降【142887841556179†L985-L1001】。因此，为了更精确地描述热生成，
+ * 后续代码通过函数根据SOC返回一个时间变化的熵系数。这里保留宏定义
+ * ENTROPY_COEFF 用于旧实现和对比。
+ */
+#define ENTROPY_COEFF -0.4e-3      /* V/K - 默认电池典型熵系数 */
+
+
+#define TIME_CONSTANT 3600.0        /* s - τ扩散时间常数 */
+#define OCV_SOC_DERIVATIVE 1.0      /* V - ∂UOCV,therm/∂S */
+
+#define BATTERY_RADIUS 0.009       /* m - 半径*/
+#define BATTERY_HEIGHT 0.065       /* m - 高度 */
+#define TOTAL_BATTERY_VOLUME (M_PI * BATTERY_RADIUS * BATTERY_RADIUS * BATTERY_HEIGHT)  /* ≈1.65e-5 m³ */
+
+/* 电池电流*/
+real get_battery_current(void)
+{
+    return C_RATE * BATTERY_CAPACITY;  /* A */
+}
+
+/* 根据电池放电电流和时间计算当前SOC（荷电状态）
+ * 假设初始SOC为1且在持续恒流放电，SOC = 1 - (I * t)/(容量 × 3600)
+ */
+real compute_soc(real Ib, real time)
+{
+    real capacity_as = BATTERY_CAPACITY * 3600.0; /* As = A*h × 3600 s/h */
+    real soc = 1.0 - (Ib * time) / capacity_as;
+    if (soc < 0.0) soc = 0.0;
+    if (soc > 1.0) soc = 1.0;
+    return soc;
+}
+
+/* 根据SOC返回熵系数 (dE/dT) [V/K]。
+ * 这是一个简化的分段线性近似，参考文献描述：熵系数在低SOC时为负，
+ * 在60% SOC附近接近零，在70–80% SOC时为正，在高SOC时略微下降【142887841556179†L985-L1001】。
+ * 数值取自一般锂电池的典型范围（±0.4 mV/K）。
+ */
+real get_entropic_coeff(real soc)
+{
+    /* 低于20% SOC：熵系数设为 -0.4 mV/K */
+    if (soc <= 0.2)
+    {
+        return -0.4e-3;
+    }
+    /* 20% < SOC ≤ 60%：从 -0.4 mV/K 线性增加到 0 */
+    else if (soc <= 0.6)
+    {
+        return -0.4e-3 + (soc - 0.2) * (0.4e-3 / 0.4);
+    }
+    /* 60% < SOC ≤ 80%：从 0 线性增加到 +0.2 mV/K */
+    else if (soc <= 0.8)
+    {
+        return (soc - 0.6) * (0.2e-3 / 0.2);
+    }
+    /* SOC > 80%：从 +0.2 mV/K 线性下降到 -0.1 mV/K 在100% SOC */
+    else
+    {
+        return 0.2e-3 - (soc - 0.8) * (0.3e-3 / 0.2);
+    }
+}
+
+/* 活化过电位 */
+real calculate_activation_overpotential(real Ib, real temp)
+{
+    real F = 96485.0;  
+    real R = 8.314;     
+ 
+    real J0 = 0.5;     
+    real I1C = BATTERY_CAPACITY;  
+
+    real argument = Ib / (2.0 * J0 * I1C);
+    
+
+    real eta_act = 2.0 * R * temp / F * asinh(argument);
+    
+    
+    if (eta_act > 0.5) eta_act = 0.5;
+    if (eta_act < 0.0) eta_act = 0.0;
+    
+    return eta_act;  /* V */
+}
+
+/* 混合项 */
+real calculate_qmix_power(real Ib, real time, real temp)
+{
+    real qmix_power = 0.0;  /* W */
+    
+    if (time > 0.0) {
+        
+        real dQcell = BATTERY_CAPACITY * 3600.0;  
+        real dQcell_tau = dQcell / TIME_CONSTANT;
+        
+      
+        real soc_rate = Ib / dQcell; 
+        real time_factor = 1.0 - exp(-time / TIME_CONSTANT);
+        
+   
+        real gradient_integral = soc_rate * time_factor / 3.0;  /* 1/s */
+        
+       
+        qmix_power = dQcell_tau * OCV_SOC_DERIVATIVE * gradient_integral;  /* A * V * 1/s = W */
+        
+   
+        real temp_factor = exp(-1500.0 * (1.0/temp - 1.0/298.15));
+        qmix_power *= temp_factor;
+    }
+    
+    return qmix_power;  /* W */
+}
+
+DEFINE_SOURCE(battery_heat_source, cell, thread, dS, eqn)
+{
+    real temp = C_T(cell, thread);       /* K */
+    real time = CURRENT_TIME;            /* s */
+    
+    /* 电池电流 */
+    real Ib = get_battery_current();     /* A */
+
+    /* 1. 欧姆损失 */
+    real power_ohmic = Ib * Ib * INTERNAL_RESISTANCE;  /* A² × Ω = W ✓ */
+    
+    /* 2. 活化过电位*/
+    real eta_act = calculate_activation_overpotential(Ib, temp);  /* V */
+    real power_activation = Ib * eta_act;  /* A × V = W ✓ */
+    
+    /* 3. 熵变：根据SOC动态计算熵系数 */
+    real soc = compute_soc(Ib, time);
+    real entropy_coeff = get_entropic_coeff(soc);
+    real power_entropic = Ib * temp * entropy_coeff;  
+    
+    /* 4. 混合项*/
+    real power_mix = calculate_qmix_power(Ib, time, temp);  
+    
+    /* 总功率*/
+    real total_power = power_ohmic + power_activation + power_entropic + power_mix; 
+   
+    real source_density = total_power / TOTAL_BATTERY_VOLUME;  
+ 
+    if (source_density < 0.0) source_density = 0.0;
+ 
+    /* 源项对温度的导数，在可逆热项中取 Ib * dE/dT / 体积 */
+    dS[eqn] = (Ib * entropy_coeff) / TOTAL_BATTERY_VOLUME;  
+    
+
+    return source_density;  
+}
